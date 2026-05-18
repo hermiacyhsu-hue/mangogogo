@@ -469,21 +469,29 @@ async function gasGet(params = {}) {
   if (!CFG.gasUrl) throw new Error('尚未設定 GAS 網址');
   const url = new URL(CFG.gasUrl);
   Object.entries(params).forEach(([k, v]) => url.searchParams.set(k, v));
-  const res = await fetch(url.toString());
+  const res = await fetch(url.toString(), { redirect: 'follow' });
   if (!res.ok) throw new Error('HTTP ' + res.status);
-  return res.json();
+  const text = await res.text();
+  try { return JSON.parse(text); }
+  catch { throw new Error('回應格式錯誤：' + text.slice(0, 100)); }
 }
 
 async function gasPost(body) {
   if (!CFG.gasUrl) throw new Error('尚未設定 GAS 網址');
+  // GAS Web App 必須用 no-cors 或用 FormData 繞過 preflight
+  // 最穩做法：把 payload 用 URL 參數帶給 GET（data 用 encodeURIComponent）
+  // 或用 FormData POST（不觸發 preflight）
+  const form = new FormData();
+  form.append('payload', JSON.stringify(body));
   const res = await fetch(CFG.gasUrl, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-    mode: 'cors',
+    body: form,
+    redirect: 'follow',
   });
   if (!res.ok) throw new Error('HTTP ' + res.status);
-  return res.json();
+  const text = await res.text();
+  try { return JSON.parse(text); }
+  catch { throw new Error('回應格式錯誤：' + text.slice(0, 100)); }
 }
 
 async function loadOrders() {
@@ -491,8 +499,10 @@ async function loadOrders() {
     // 離線模式：從 localStorage 讀取
     const saved = localStorage.getItem('mango_offline');
     orders = saved ? JSON.parse(saved) : getSampleOrders();
+    // 若使用樣本資料，也存入 localStorage 讓後續操作可以儲存
+    if (!saved) saveOffline();
     refreshAll();
-    setSyncStatus('', '離線模式');
+    setSyncStatus('', '離線模式（資料存於本機）');
     return;
   }
   setSyncStatus('syncing', '同步中…');
@@ -500,12 +510,12 @@ async function loadOrders() {
     const data = await gasGet({ action: 'list' });
     if (data.error) throw new Error(data.error);
     orders = data.orders || [];
+    saveOffline(); // 也存本機作為 fallback
     refreshAll();
     setSyncStatus('', '已同步 ' + new Date().toLocaleTimeString('zh-TW', {hour:'2-digit',minute:'2-digit'}));
   } catch (e) {
-    setSyncStatus('error', '同步失敗');
-    toast('同步失敗：' + e.message, 'error');
-    // Fallback to local
+    setSyncStatus('error', '同步失敗 — 使用本機快取');
+    toast('GAS 連線失敗，使用本機快取：' + e.message, 'error');
     const saved = localStorage.getItem('mango_offline');
     if (saved) orders = JSON.parse(saved);
     refreshAll();
@@ -582,10 +592,14 @@ function chgQty(rowId, d) {
 }
 function getOrderItems() {
   const items = [];
-  document.querySelectorAll('[id^="sr-"]').forEach(row => {
-    const id = row.id.replace('sr-', ''); if (isNaN(id)) return;
-    const sel = row.querySelector('.spec-card.sel'); if (!sel) return;
-    const qty = +document.getElementById('sr-qty-' + id)?.value || 0;
+  // 只選頂層 spec-row-wrap div，避免抓到子元素 sr-lbl-N / sr-qty-N
+  document.querySelectorAll('.spec-row-wrap').forEach(row => {
+    const id = row.id.replace('sr-', '');
+    if (!id || isNaN(Number(id))) return;
+    const sel = row.querySelector('.spec-card.sel');
+    if (!sel) return;
+    const qtyEl = document.getElementById('sr-qty-' + id);
+    const qty = qtyEl ? (+qtyEl.value || 0) : 0;
     if (sel.dataset.spec && qty > 0) items.push({ spec: sel.dataset.spec, qty });
   });
   return items;
@@ -695,7 +709,6 @@ async function addOrder() {
     orders.unshift(o);
     saveOffline();
     refreshAll(); closeModal('modal-add');
-    ['f-name', 'f-phone', 'f-note', 'f-payment-note', 'f-ship-date-global'].forEach(id => { const el = document.getElementById(id); if (el) el.value = ''; });
     toast('訂單 ' + o.id + ' 已新增！');
     setSyncStatus('', '已同步');
     // Auto open LINE helper for new order confirmation
@@ -1206,7 +1219,19 @@ function exportCSV() {
 // ══════════════════════════════════════════════
 function openModal(id) {
   document.getElementById(id)?.classList.add('open');
-  if (id === 'modal-add') { initSpecRows(); document.getElementById('ship-blocks-container').innerHTML = ''; }
+  if (id === 'modal-add') {
+    // 重置表單
+    ['f-name', 'f-phone', 'f-note', 'f-payment-note', 'f-ship-date-global'].forEach(fid => {
+      const el = document.getElementById(fid); if (el) el.value = '';
+    });
+    // 重置 tabs 回到第一頁
+    document.querySelectorAll('#modal-add .tab').forEach((t, i) => t.classList.toggle('active', i === 0));
+    ['tab-basic','tab-order','tab-delivery','tab-payment'].forEach((tid, i) => {
+      const el = document.getElementById(tid); if (el) el.style.display = i === 0 ? '' : 'none';
+    });
+    initSpecRows();
+    document.getElementById('ship-blocks-container').innerHTML = '';
+  }
 }
 function closeModal(id) { document.getElementById(id)?.classList.remove('open'); }
 document.querySelectorAll('.modal-overlay').forEach(m => m.addEventListener('click', e => { if (e.target === m) m.classList.remove('open'); }));
